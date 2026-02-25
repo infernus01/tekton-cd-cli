@@ -1,4 +1,4 @@
-// Copyright 2023 Google LLC
+// Copyright 2025 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -28,8 +28,8 @@ import (
 
 	iampb "cloud.google.com/go/iam/apiv1/iampb"
 	kmspb "cloud.google.com/go/kms/apiv1/kmspb"
+	longrunningpb "cloud.google.com/go/longrunning/autogen/longrunningpb"
 	gax "github.com/googleapis/gax-go/v2"
-	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
@@ -38,7 +38,6 @@ import (
 	locationpb "google.golang.org/genproto/googleapis/cloud/location"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -74,21 +73,27 @@ type KeyManagementCallOptions struct {
 	AsymmetricDecrypt             []gax.CallOption
 	MacSign                       []gax.CallOption
 	MacVerify                     []gax.CallOption
+	Decapsulate                   []gax.CallOption
 	GenerateRandomBytes           []gax.CallOption
 	GetLocation                   []gax.CallOption
 	ListLocations                 []gax.CallOption
 	GetIamPolicy                  []gax.CallOption
 	SetIamPolicy                  []gax.CallOption
 	TestIamPermissions            []gax.CallOption
+	GetOperation                  []gax.CallOption
 }
 
 func defaultKeyManagementGRPCClientOptions() []option.ClientOption {
 	return []option.ClientOption{
 		internaloption.WithDefaultEndpoint("cloudkms.googleapis.com:443"),
+		internaloption.WithDefaultEndpointTemplate("cloudkms.UNIVERSE_DOMAIN:443"),
 		internaloption.WithDefaultMTLSEndpoint("cloudkms.mtls.googleapis.com:443"),
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
 		internaloption.WithDefaultAudience("https://cloudkms.googleapis.com/"),
 		internaloption.WithDefaultScopes(DefaultAuthScopes()...),
 		internaloption.EnableJwtWithScope(),
+		internaloption.AllowHardBoundTokens("MTLS_S2A"),
+		internaloption.EnableNewAuthLibrary(),
 		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(math.MaxInt32))),
 	}
@@ -403,6 +408,7 @@ func defaultKeyManagementCallOptions() *KeyManagementCallOptions {
 				})
 			}),
 		},
+		Decapsulate: []gax.CallOption{},
 		GenerateRandomBytes: []gax.CallOption{
 			gax.WithTimeout(60000 * time.Millisecond),
 			gax.WithRetry(func() gax.Retryer {
@@ -421,6 +427,7 @@ func defaultKeyManagementCallOptions() *KeyManagementCallOptions {
 		GetIamPolicy:       []gax.CallOption{},
 		SetIamPolicy:       []gax.CallOption{},
 		TestIamPermissions: []gax.CallOption{},
+		GetOperation:       []gax.CallOption{},
 	}
 }
 
@@ -710,6 +717,7 @@ func defaultKeyManagementRESTCallOptions() *KeyManagementCallOptions {
 					http.StatusGatewayTimeout)
 			}),
 		},
+		Decapsulate: []gax.CallOption{},
 		GenerateRandomBytes: []gax.CallOption{
 			gax.WithTimeout(60000 * time.Millisecond),
 			gax.WithRetry(func() gax.Retryer {
@@ -727,6 +735,7 @@ func defaultKeyManagementRESTCallOptions() *KeyManagementCallOptions {
 		GetIamPolicy:       []gax.CallOption{},
 		SetIamPolicy:       []gax.CallOption{},
 		TestIamPermissions: []gax.CallOption{},
+		GetOperation:       []gax.CallOption{},
 	}
 }
 
@@ -762,12 +771,14 @@ type internalKeyManagementClient interface {
 	AsymmetricDecrypt(context.Context, *kmspb.AsymmetricDecryptRequest, ...gax.CallOption) (*kmspb.AsymmetricDecryptResponse, error)
 	MacSign(context.Context, *kmspb.MacSignRequest, ...gax.CallOption) (*kmspb.MacSignResponse, error)
 	MacVerify(context.Context, *kmspb.MacVerifyRequest, ...gax.CallOption) (*kmspb.MacVerifyResponse, error)
+	Decapsulate(context.Context, *kmspb.DecapsulateRequest, ...gax.CallOption) (*kmspb.DecapsulateResponse, error)
 	GenerateRandomBytes(context.Context, *kmspb.GenerateRandomBytesRequest, ...gax.CallOption) (*kmspb.GenerateRandomBytesResponse, error)
 	GetLocation(context.Context, *locationpb.GetLocationRequest, ...gax.CallOption) (*locationpb.Location, error)
 	ListLocations(context.Context, *locationpb.ListLocationsRequest, ...gax.CallOption) *LocationIterator
 	GetIamPolicy(context.Context, *iampb.GetIamPolicyRequest, ...gax.CallOption) (*iampb.Policy, error)
 	SetIamPolicy(context.Context, *iampb.SetIamPolicyRequest, ...gax.CallOption) (*iampb.Policy, error)
 	TestIamPermissions(context.Context, *iampb.TestIamPermissionsRequest, ...gax.CallOption) (*iampb.TestIamPermissionsResponse, error)
+	GetOperation(context.Context, *longrunningpb.GetOperationRequest, ...gax.CallOption) (*longrunningpb.Operation, error)
 }
 
 // KeyManagementClient is a client for interacting with Cloud Key Management Service (KMS) API.
@@ -1055,6 +1066,15 @@ func (c *KeyManagementClient) MacVerify(ctx context.Context, req *kmspb.MacVerif
 	return c.internalClient.MacVerify(ctx, req, opts...)
 }
 
+// Decapsulate decapsulates data that was encapsulated with a public key retrieved from
+// GetPublicKey
+// corresponding to a CryptoKeyVersion
+// with CryptoKey.purpose
+// KEY_ENCAPSULATION.
+func (c *KeyManagementClient) Decapsulate(ctx context.Context, req *kmspb.DecapsulateRequest, opts ...gax.CallOption) (*kmspb.DecapsulateResponse, error) {
+	return c.internalClient.Decapsulate(ctx, req, opts...)
+}
+
 // GenerateRandomBytes generate random bytes using the Cloud KMS randomness source in the provided
 // location.
 func (c *KeyManagementClient) GenerateRandomBytes(ctx context.Context, req *kmspb.GenerateRandomBytesRequest, opts ...gax.CallOption) (*kmspb.GenerateRandomBytesResponse, error) {
@@ -1097,6 +1117,11 @@ func (c *KeyManagementClient) TestIamPermissions(ctx context.Context, req *iampb
 	return c.internalClient.TestIamPermissions(ctx, req, opts...)
 }
 
+// GetOperation is a utility method from google.longrunning.Operations.
+func (c *KeyManagementClient) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest, opts ...gax.CallOption) (*longrunningpb.Operation, error) {
+	return c.internalClient.GetOperation(ctx, req, opts...)
+}
+
 // keyManagementGRPCClient is a client for interacting with Cloud Key Management Service (KMS) API over gRPC transport.
 //
 // Methods, except Close, may be called concurrently. However, fields must not be modified concurrently with method calls.
@@ -1110,12 +1135,16 @@ type keyManagementGRPCClient struct {
 	// The gRPC API client.
 	keyManagementClient kmspb.KeyManagementServiceClient
 
+	operationsClient longrunningpb.OperationsClient
+
 	iamPolicyClient iampb.IAMPolicyClient
 
 	locationsClient locationpb.LocationsClient
 
 	// The x-goog-* metadata to be sent with each request.
-	xGoogMetadata metadata.MD
+	xGoogHeaders []string
+
+	logger *slog.Logger
 }
 
 // NewKeyManagementClient creates a new key management service client based on gRPC.
@@ -1156,6 +1185,8 @@ func NewKeyManagementClient(ctx context.Context, opts ...option.ClientOption) (*
 		connPool:            connPool,
 		keyManagementClient: kmspb.NewKeyManagementServiceClient(connPool),
 		CallOptions:         &client.CallOptions,
+		logger:              internaloption.GetLogger(opts),
+		operationsClient:    longrunningpb.NewOperationsClient(connPool),
 		iamPolicyClient:     iampb.NewIAMPolicyClient(connPool),
 		locationsClient:     locationpb.NewLocationsClient(connPool),
 	}
@@ -1179,8 +1210,10 @@ func (c *keyManagementGRPCClient) Connection() *grpc.ClientConn {
 // use by Google-written clients.
 func (c *keyManagementGRPCClient) setGoogleClientInfo(keyval ...string) {
 	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
-	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "grpc", grpc.Version)
-	c.xGoogMetadata = metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
+	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "grpc", grpc.Version, "pb", protoVersion)
+	c.xGoogHeaders = []string{
+		"x-goog-api-client", gax.XGoogHeader(kv...),
+	}
 }
 
 // Close closes the connection to the API service. The user should invoke this when
@@ -1197,11 +1230,13 @@ type keyManagementRESTClient struct {
 	// The http client.
 	httpClient *http.Client
 
-	// The x-goog-* metadata to be sent with each request.
-	xGoogMetadata metadata.MD
+	// The x-goog-* headers to be sent with each request.
+	xGoogHeaders []string
 
 	// Points back to the CallOptions field of the containing KeyManagementClient
 	CallOptions **KeyManagementCallOptions
+
+	logger *slog.Logger
 }
 
 // NewKeyManagementRESTClient creates a new key management service rest client.
@@ -1233,6 +1268,7 @@ func NewKeyManagementRESTClient(ctx context.Context, opts ...option.ClientOption
 		endpoint:    endpoint,
 		httpClient:  httpClient,
 		CallOptions: &callOpts,
+		logger:      internaloption.GetLogger(opts),
 	}
 	c.setGoogleClientInfo()
 
@@ -1242,9 +1278,12 @@ func NewKeyManagementRESTClient(ctx context.Context, opts ...option.ClientOption
 func defaultKeyManagementRESTClientOptions() []option.ClientOption {
 	return []option.ClientOption{
 		internaloption.WithDefaultEndpoint("https://cloudkms.googleapis.com"),
+		internaloption.WithDefaultEndpointTemplate("https://cloudkms.UNIVERSE_DOMAIN"),
 		internaloption.WithDefaultMTLSEndpoint("https://cloudkms.mtls.googleapis.com"),
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
 		internaloption.WithDefaultAudience("https://cloudkms.googleapis.com/"),
 		internaloption.WithDefaultScopes(DefaultAuthScopes()...),
+		internaloption.EnableNewAuthLibrary(),
 	}
 }
 
@@ -1253,8 +1292,10 @@ func defaultKeyManagementRESTClientOptions() []option.ClientOption {
 // use by Google-written clients.
 func (c *keyManagementRESTClient) setGoogleClientInfo(keyval ...string) {
 	kv := append([]string{"gl-go", gax.GoVersion}, keyval...)
-	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "rest", "UNKNOWN")
-	c.xGoogMetadata = metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
+	kv = append(kv, "gapic", getVersionClient(), "gax", gax.Version, "rest", "UNKNOWN", "pb", protoVersion)
+	c.xGoogHeaders = []string{
+		"x-goog-api-client", gax.XGoogHeader(kv...),
+	}
 }
 
 // Close closes the connection to the API service. The user should invoke this when
@@ -1272,9 +1313,10 @@ func (c *keyManagementRESTClient) Connection() *grpc.ClientConn {
 	return nil
 }
 func (c *keyManagementGRPCClient) ListKeyRings(ctx context.Context, req *kmspb.ListKeyRingsRequest, opts ...gax.CallOption) *KeyRingIterator {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).ListKeyRings[0:len((*c.CallOptions).ListKeyRings):len((*c.CallOptions).ListKeyRings)], opts...)
 	it := &KeyRingIterator{}
 	req = proto.Clone(req).(*kmspb.ListKeyRingsRequest)
@@ -1290,7 +1332,7 @@ func (c *keyManagementGRPCClient) ListKeyRings(ctx context.Context, req *kmspb.L
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.keyManagementClient.ListKeyRings(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.keyManagementClient.ListKeyRings, req, settings.GRPC, c.logger, "ListKeyRings")
 			return err
 		}, opts...)
 		if err != nil {
@@ -1317,9 +1359,10 @@ func (c *keyManagementGRPCClient) ListKeyRings(ctx context.Context, req *kmspb.L
 }
 
 func (c *keyManagementGRPCClient) ListCryptoKeys(ctx context.Context, req *kmspb.ListCryptoKeysRequest, opts ...gax.CallOption) *CryptoKeyIterator {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).ListCryptoKeys[0:len((*c.CallOptions).ListCryptoKeys):len((*c.CallOptions).ListCryptoKeys)], opts...)
 	it := &CryptoKeyIterator{}
 	req = proto.Clone(req).(*kmspb.ListCryptoKeysRequest)
@@ -1335,7 +1378,7 @@ func (c *keyManagementGRPCClient) ListCryptoKeys(ctx context.Context, req *kmspb
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.keyManagementClient.ListCryptoKeys(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.keyManagementClient.ListCryptoKeys, req, settings.GRPC, c.logger, "ListCryptoKeys")
 			return err
 		}, opts...)
 		if err != nil {
@@ -1362,9 +1405,10 @@ func (c *keyManagementGRPCClient) ListCryptoKeys(ctx context.Context, req *kmspb
 }
 
 func (c *keyManagementGRPCClient) ListCryptoKeyVersions(ctx context.Context, req *kmspb.ListCryptoKeyVersionsRequest, opts ...gax.CallOption) *CryptoKeyVersionIterator {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).ListCryptoKeyVersions[0:len((*c.CallOptions).ListCryptoKeyVersions):len((*c.CallOptions).ListCryptoKeyVersions)], opts...)
 	it := &CryptoKeyVersionIterator{}
 	req = proto.Clone(req).(*kmspb.ListCryptoKeyVersionsRequest)
@@ -1380,7 +1424,7 @@ func (c *keyManagementGRPCClient) ListCryptoKeyVersions(ctx context.Context, req
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.keyManagementClient.ListCryptoKeyVersions(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.keyManagementClient.ListCryptoKeyVersions, req, settings.GRPC, c.logger, "ListCryptoKeyVersions")
 			return err
 		}, opts...)
 		if err != nil {
@@ -1407,9 +1451,10 @@ func (c *keyManagementGRPCClient) ListCryptoKeyVersions(ctx context.Context, req
 }
 
 func (c *keyManagementGRPCClient) ListImportJobs(ctx context.Context, req *kmspb.ListImportJobsRequest, opts ...gax.CallOption) *ImportJobIterator {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).ListImportJobs[0:len((*c.CallOptions).ListImportJobs):len((*c.CallOptions).ListImportJobs)], opts...)
 	it := &ImportJobIterator{}
 	req = proto.Clone(req).(*kmspb.ListImportJobsRequest)
@@ -1425,7 +1470,7 @@ func (c *keyManagementGRPCClient) ListImportJobs(ctx context.Context, req *kmspb
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.keyManagementClient.ListImportJobs(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.keyManagementClient.ListImportJobs, req, settings.GRPC, c.logger, "ListImportJobs")
 			return err
 		}, opts...)
 		if err != nil {
@@ -1452,14 +1497,15 @@ func (c *keyManagementGRPCClient) ListImportJobs(ctx context.Context, req *kmspb
 }
 
 func (c *keyManagementGRPCClient) GetKeyRing(ctx context.Context, req *kmspb.GetKeyRingRequest, opts ...gax.CallOption) (*kmspb.KeyRing, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetKeyRing[0:len((*c.CallOptions).GetKeyRing):len((*c.CallOptions).GetKeyRing)], opts...)
 	var resp *kmspb.KeyRing
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.GetKeyRing(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.GetKeyRing, req, settings.GRPC, c.logger, "GetKeyRing")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1469,14 +1515,15 @@ func (c *keyManagementGRPCClient) GetKeyRing(ctx context.Context, req *kmspb.Get
 }
 
 func (c *keyManagementGRPCClient) GetCryptoKey(ctx context.Context, req *kmspb.GetCryptoKeyRequest, opts ...gax.CallOption) (*kmspb.CryptoKey, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetCryptoKey[0:len((*c.CallOptions).GetCryptoKey):len((*c.CallOptions).GetCryptoKey)], opts...)
 	var resp *kmspb.CryptoKey
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.GetCryptoKey(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.GetCryptoKey, req, settings.GRPC, c.logger, "GetCryptoKey")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1486,14 +1533,15 @@ func (c *keyManagementGRPCClient) GetCryptoKey(ctx context.Context, req *kmspb.G
 }
 
 func (c *keyManagementGRPCClient) GetCryptoKeyVersion(ctx context.Context, req *kmspb.GetCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetCryptoKeyVersion[0:len((*c.CallOptions).GetCryptoKeyVersion):len((*c.CallOptions).GetCryptoKeyVersion)], opts...)
 	var resp *kmspb.CryptoKeyVersion
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.GetCryptoKeyVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.GetCryptoKeyVersion, req, settings.GRPC, c.logger, "GetCryptoKeyVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1503,14 +1551,15 @@ func (c *keyManagementGRPCClient) GetCryptoKeyVersion(ctx context.Context, req *
 }
 
 func (c *keyManagementGRPCClient) GetPublicKey(ctx context.Context, req *kmspb.GetPublicKeyRequest, opts ...gax.CallOption) (*kmspb.PublicKey, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetPublicKey[0:len((*c.CallOptions).GetPublicKey):len((*c.CallOptions).GetPublicKey)], opts...)
 	var resp *kmspb.PublicKey
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.GetPublicKey(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.GetPublicKey, req, settings.GRPC, c.logger, "GetPublicKey")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1520,14 +1569,15 @@ func (c *keyManagementGRPCClient) GetPublicKey(ctx context.Context, req *kmspb.G
 }
 
 func (c *keyManagementGRPCClient) GetImportJob(ctx context.Context, req *kmspb.GetImportJobRequest, opts ...gax.CallOption) (*kmspb.ImportJob, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetImportJob[0:len((*c.CallOptions).GetImportJob):len((*c.CallOptions).GetImportJob)], opts...)
 	var resp *kmspb.ImportJob
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.GetImportJob(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.GetImportJob, req, settings.GRPC, c.logger, "GetImportJob")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1537,14 +1587,15 @@ func (c *keyManagementGRPCClient) GetImportJob(ctx context.Context, req *kmspb.G
 }
 
 func (c *keyManagementGRPCClient) CreateKeyRing(ctx context.Context, req *kmspb.CreateKeyRingRequest, opts ...gax.CallOption) (*kmspb.KeyRing, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).CreateKeyRing[0:len((*c.CallOptions).CreateKeyRing):len((*c.CallOptions).CreateKeyRing)], opts...)
 	var resp *kmspb.KeyRing
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.CreateKeyRing(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.CreateKeyRing, req, settings.GRPC, c.logger, "CreateKeyRing")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1554,14 +1605,15 @@ func (c *keyManagementGRPCClient) CreateKeyRing(ctx context.Context, req *kmspb.
 }
 
 func (c *keyManagementGRPCClient) CreateCryptoKey(ctx context.Context, req *kmspb.CreateCryptoKeyRequest, opts ...gax.CallOption) (*kmspb.CryptoKey, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).CreateCryptoKey[0:len((*c.CallOptions).CreateCryptoKey):len((*c.CallOptions).CreateCryptoKey)], opts...)
 	var resp *kmspb.CryptoKey
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.CreateCryptoKey(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.CreateCryptoKey, req, settings.GRPC, c.logger, "CreateCryptoKey")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1571,14 +1623,15 @@ func (c *keyManagementGRPCClient) CreateCryptoKey(ctx context.Context, req *kmsp
 }
 
 func (c *keyManagementGRPCClient) CreateCryptoKeyVersion(ctx context.Context, req *kmspb.CreateCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).CreateCryptoKeyVersion[0:len((*c.CallOptions).CreateCryptoKeyVersion):len((*c.CallOptions).CreateCryptoKeyVersion)], opts...)
 	var resp *kmspb.CryptoKeyVersion
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.CreateCryptoKeyVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.CreateCryptoKeyVersion, req, settings.GRPC, c.logger, "CreateCryptoKeyVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1588,14 +1641,15 @@ func (c *keyManagementGRPCClient) CreateCryptoKeyVersion(ctx context.Context, re
 }
 
 func (c *keyManagementGRPCClient) ImportCryptoKeyVersion(ctx context.Context, req *kmspb.ImportCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).ImportCryptoKeyVersion[0:len((*c.CallOptions).ImportCryptoKeyVersion):len((*c.CallOptions).ImportCryptoKeyVersion)], opts...)
 	var resp *kmspb.CryptoKeyVersion
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.ImportCryptoKeyVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.ImportCryptoKeyVersion, req, settings.GRPC, c.logger, "ImportCryptoKeyVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1605,14 +1659,15 @@ func (c *keyManagementGRPCClient) ImportCryptoKeyVersion(ctx context.Context, re
 }
 
 func (c *keyManagementGRPCClient) CreateImportJob(ctx context.Context, req *kmspb.CreateImportJobRequest, opts ...gax.CallOption) (*kmspb.ImportJob, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).CreateImportJob[0:len((*c.CallOptions).CreateImportJob):len((*c.CallOptions).CreateImportJob)], opts...)
 	var resp *kmspb.ImportJob
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.CreateImportJob(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.CreateImportJob, req, settings.GRPC, c.logger, "CreateImportJob")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1622,14 +1677,15 @@ func (c *keyManagementGRPCClient) CreateImportJob(ctx context.Context, req *kmsp
 }
 
 func (c *keyManagementGRPCClient) UpdateCryptoKey(ctx context.Context, req *kmspb.UpdateCryptoKeyRequest, opts ...gax.CallOption) (*kmspb.CryptoKey, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key.name", url.QueryEscape(req.GetCryptoKey().GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key.name", url.QueryEscape(req.GetCryptoKey().GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).UpdateCryptoKey[0:len((*c.CallOptions).UpdateCryptoKey):len((*c.CallOptions).UpdateCryptoKey)], opts...)
 	var resp *kmspb.CryptoKey
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.UpdateCryptoKey(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.UpdateCryptoKey, req, settings.GRPC, c.logger, "UpdateCryptoKey")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1639,14 +1695,15 @@ func (c *keyManagementGRPCClient) UpdateCryptoKey(ctx context.Context, req *kmsp
 }
 
 func (c *keyManagementGRPCClient) UpdateCryptoKeyVersion(ctx context.Context, req *kmspb.UpdateCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key_version.name", url.QueryEscape(req.GetCryptoKeyVersion().GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key_version.name", url.QueryEscape(req.GetCryptoKeyVersion().GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).UpdateCryptoKeyVersion[0:len((*c.CallOptions).UpdateCryptoKeyVersion):len((*c.CallOptions).UpdateCryptoKeyVersion)], opts...)
 	var resp *kmspb.CryptoKeyVersion
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.UpdateCryptoKeyVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.UpdateCryptoKeyVersion, req, settings.GRPC, c.logger, "UpdateCryptoKeyVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1656,14 +1713,15 @@ func (c *keyManagementGRPCClient) UpdateCryptoKeyVersion(ctx context.Context, re
 }
 
 func (c *keyManagementGRPCClient) UpdateCryptoKeyPrimaryVersion(ctx context.Context, req *kmspb.UpdateCryptoKeyPrimaryVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKey, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).UpdateCryptoKeyPrimaryVersion[0:len((*c.CallOptions).UpdateCryptoKeyPrimaryVersion):len((*c.CallOptions).UpdateCryptoKeyPrimaryVersion)], opts...)
 	var resp *kmspb.CryptoKey
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.UpdateCryptoKeyPrimaryVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.UpdateCryptoKeyPrimaryVersion, req, settings.GRPC, c.logger, "UpdateCryptoKeyPrimaryVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1673,14 +1731,15 @@ func (c *keyManagementGRPCClient) UpdateCryptoKeyPrimaryVersion(ctx context.Cont
 }
 
 func (c *keyManagementGRPCClient) DestroyCryptoKeyVersion(ctx context.Context, req *kmspb.DestroyCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).DestroyCryptoKeyVersion[0:len((*c.CallOptions).DestroyCryptoKeyVersion):len((*c.CallOptions).DestroyCryptoKeyVersion)], opts...)
 	var resp *kmspb.CryptoKeyVersion
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.DestroyCryptoKeyVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.DestroyCryptoKeyVersion, req, settings.GRPC, c.logger, "DestroyCryptoKeyVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1690,14 +1749,15 @@ func (c *keyManagementGRPCClient) DestroyCryptoKeyVersion(ctx context.Context, r
 }
 
 func (c *keyManagementGRPCClient) RestoreCryptoKeyVersion(ctx context.Context, req *kmspb.RestoreCryptoKeyVersionRequest, opts ...gax.CallOption) (*kmspb.CryptoKeyVersion, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).RestoreCryptoKeyVersion[0:len((*c.CallOptions).RestoreCryptoKeyVersion):len((*c.CallOptions).RestoreCryptoKeyVersion)], opts...)
 	var resp *kmspb.CryptoKeyVersion
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.RestoreCryptoKeyVersion(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.RestoreCryptoKeyVersion, req, settings.GRPC, c.logger, "RestoreCryptoKeyVersion")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1707,14 +1767,15 @@ func (c *keyManagementGRPCClient) RestoreCryptoKeyVersion(ctx context.Context, r
 }
 
 func (c *keyManagementGRPCClient) Encrypt(ctx context.Context, req *kmspb.EncryptRequest, opts ...gax.CallOption) (*kmspb.EncryptResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).Encrypt[0:len((*c.CallOptions).Encrypt):len((*c.CallOptions).Encrypt)], opts...)
 	var resp *kmspb.EncryptResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.Encrypt(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.Encrypt, req, settings.GRPC, c.logger, "Encrypt")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1724,14 +1785,15 @@ func (c *keyManagementGRPCClient) Encrypt(ctx context.Context, req *kmspb.Encryp
 }
 
 func (c *keyManagementGRPCClient) Decrypt(ctx context.Context, req *kmspb.DecryptRequest, opts ...gax.CallOption) (*kmspb.DecryptResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).Decrypt[0:len((*c.CallOptions).Decrypt):len((*c.CallOptions).Decrypt)], opts...)
 	var resp *kmspb.DecryptResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.Decrypt(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.Decrypt, req, settings.GRPC, c.logger, "Decrypt")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1741,14 +1803,15 @@ func (c *keyManagementGRPCClient) Decrypt(ctx context.Context, req *kmspb.Decryp
 }
 
 func (c *keyManagementGRPCClient) RawEncrypt(ctx context.Context, req *kmspb.RawEncryptRequest, opts ...gax.CallOption) (*kmspb.RawEncryptResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).RawEncrypt[0:len((*c.CallOptions).RawEncrypt):len((*c.CallOptions).RawEncrypt)], opts...)
 	var resp *kmspb.RawEncryptResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.RawEncrypt(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.RawEncrypt, req, settings.GRPC, c.logger, "RawEncrypt")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1758,14 +1821,15 @@ func (c *keyManagementGRPCClient) RawEncrypt(ctx context.Context, req *kmspb.Raw
 }
 
 func (c *keyManagementGRPCClient) RawDecrypt(ctx context.Context, req *kmspb.RawDecryptRequest, opts ...gax.CallOption) (*kmspb.RawDecryptResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).RawDecrypt[0:len((*c.CallOptions).RawDecrypt):len((*c.CallOptions).RawDecrypt)], opts...)
 	var resp *kmspb.RawDecryptResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.RawDecrypt(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.RawDecrypt, req, settings.GRPC, c.logger, "RawDecrypt")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1775,14 +1839,15 @@ func (c *keyManagementGRPCClient) RawDecrypt(ctx context.Context, req *kmspb.Raw
 }
 
 func (c *keyManagementGRPCClient) AsymmetricSign(ctx context.Context, req *kmspb.AsymmetricSignRequest, opts ...gax.CallOption) (*kmspb.AsymmetricSignResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).AsymmetricSign[0:len((*c.CallOptions).AsymmetricSign):len((*c.CallOptions).AsymmetricSign)], opts...)
 	var resp *kmspb.AsymmetricSignResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.AsymmetricSign(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.AsymmetricSign, req, settings.GRPC, c.logger, "AsymmetricSign")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1792,14 +1857,15 @@ func (c *keyManagementGRPCClient) AsymmetricSign(ctx context.Context, req *kmspb
 }
 
 func (c *keyManagementGRPCClient) AsymmetricDecrypt(ctx context.Context, req *kmspb.AsymmetricDecryptRequest, opts ...gax.CallOption) (*kmspb.AsymmetricDecryptResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).AsymmetricDecrypt[0:len((*c.CallOptions).AsymmetricDecrypt):len((*c.CallOptions).AsymmetricDecrypt)], opts...)
 	var resp *kmspb.AsymmetricDecryptResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.AsymmetricDecrypt(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.AsymmetricDecrypt, req, settings.GRPC, c.logger, "AsymmetricDecrypt")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1809,14 +1875,15 @@ func (c *keyManagementGRPCClient) AsymmetricDecrypt(ctx context.Context, req *km
 }
 
 func (c *keyManagementGRPCClient) MacSign(ctx context.Context, req *kmspb.MacSignRequest, opts ...gax.CallOption) (*kmspb.MacSignResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).MacSign[0:len((*c.CallOptions).MacSign):len((*c.CallOptions).MacSign)], opts...)
 	var resp *kmspb.MacSignResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.MacSign(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.MacSign, req, settings.GRPC, c.logger, "MacSign")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1826,14 +1893,33 @@ func (c *keyManagementGRPCClient) MacSign(ctx context.Context, req *kmspb.MacSig
 }
 
 func (c *keyManagementGRPCClient) MacVerify(ctx context.Context, req *kmspb.MacVerifyRequest, opts ...gax.CallOption) (*kmspb.MacVerifyResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).MacVerify[0:len((*c.CallOptions).MacVerify):len((*c.CallOptions).MacVerify)], opts...)
 	var resp *kmspb.MacVerifyResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.MacVerify(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.MacVerify, req, settings.GRPC, c.logger, "MacVerify")
+		return err
+	}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *keyManagementGRPCClient) Decapsulate(ctx context.Context, req *kmspb.DecapsulateRequest, opts ...gax.CallOption) (*kmspb.DecapsulateResponse, error) {
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
+
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	opts = append((*c.CallOptions).Decapsulate[0:len((*c.CallOptions).Decapsulate):len((*c.CallOptions).Decapsulate)], opts...)
+	var resp *kmspb.DecapsulateResponse
+	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		var err error
+		resp, err = executeRPC(ctx, c.keyManagementClient.Decapsulate, req, settings.GRPC, c.logger, "Decapsulate")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1843,14 +1929,15 @@ func (c *keyManagementGRPCClient) MacVerify(ctx context.Context, req *kmspb.MacV
 }
 
 func (c *keyManagementGRPCClient) GenerateRandomBytes(ctx context.Context, req *kmspb.GenerateRandomBytesRequest, opts ...gax.CallOption) (*kmspb.GenerateRandomBytesResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "location", url.QueryEscape(req.GetLocation())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "location", url.QueryEscape(req.GetLocation()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GenerateRandomBytes[0:len((*c.CallOptions).GenerateRandomBytes):len((*c.CallOptions).GenerateRandomBytes)], opts...)
 	var resp *kmspb.GenerateRandomBytesResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.keyManagementClient.GenerateRandomBytes(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.keyManagementClient.GenerateRandomBytes, req, settings.GRPC, c.logger, "GenerateRandomBytes")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1860,14 +1947,15 @@ func (c *keyManagementGRPCClient) GenerateRandomBytes(ctx context.Context, req *
 }
 
 func (c *keyManagementGRPCClient) GetLocation(ctx context.Context, req *locationpb.GetLocationRequest, opts ...gax.CallOption) (*locationpb.Location, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetLocation[0:len((*c.CallOptions).GetLocation):len((*c.CallOptions).GetLocation)], opts...)
 	var resp *locationpb.Location
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.locationsClient.GetLocation(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.locationsClient.GetLocation, req, settings.GRPC, c.logger, "GetLocation")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1877,9 +1965,10 @@ func (c *keyManagementGRPCClient) GetLocation(ctx context.Context, req *location
 }
 
 func (c *keyManagementGRPCClient) ListLocations(ctx context.Context, req *locationpb.ListLocationsRequest, opts ...gax.CallOption) *LocationIterator {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).ListLocations[0:len((*c.CallOptions).ListLocations):len((*c.CallOptions).ListLocations)], opts...)
 	it := &LocationIterator{}
 	req = proto.Clone(req).(*locationpb.ListLocationsRequest)
@@ -1895,7 +1984,7 @@ func (c *keyManagementGRPCClient) ListLocations(ctx context.Context, req *locati
 		}
 		err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			var err error
-			resp, err = c.locationsClient.ListLocations(ctx, req, settings.GRPC...)
+			resp, err = executeRPC(ctx, c.locationsClient.ListLocations, req, settings.GRPC, c.logger, "ListLocations")
 			return err
 		}, opts...)
 		if err != nil {
@@ -1922,14 +2011,15 @@ func (c *keyManagementGRPCClient) ListLocations(ctx context.Context, req *locati
 }
 
 func (c *keyManagementGRPCClient) GetIamPolicy(ctx context.Context, req *iampb.GetIamPolicyRequest, opts ...gax.CallOption) (*iampb.Policy, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).GetIamPolicy[0:len((*c.CallOptions).GetIamPolicy):len((*c.CallOptions).GetIamPolicy)], opts...)
 	var resp *iampb.Policy
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.iamPolicyClient.GetIamPolicy(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.iamPolicyClient.GetIamPolicy, req, settings.GRPC, c.logger, "GetIamPolicy")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1939,14 +2029,15 @@ func (c *keyManagementGRPCClient) GetIamPolicy(ctx context.Context, req *iampb.G
 }
 
 func (c *keyManagementGRPCClient) SetIamPolicy(ctx context.Context, req *iampb.SetIamPolicyRequest, opts ...gax.CallOption) (*iampb.Policy, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).SetIamPolicy[0:len((*c.CallOptions).SetIamPolicy):len((*c.CallOptions).SetIamPolicy)], opts...)
 	var resp *iampb.Policy
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.iamPolicyClient.SetIamPolicy(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.iamPolicyClient.SetIamPolicy, req, settings.GRPC, c.logger, "SetIamPolicy")
 		return err
 	}, opts...)
 	if err != nil {
@@ -1956,14 +2047,33 @@ func (c *keyManagementGRPCClient) SetIamPolicy(ctx context.Context, req *iampb.S
 }
 
 func (c *keyManagementGRPCClient) TestIamPermissions(ctx context.Context, req *iampb.TestIamPermissionsRequest, opts ...gax.CallOption) (*iampb.TestIamPermissionsResponse, error) {
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource()))}
 
-	ctx = insertMetadata(ctx, c.xGoogMetadata, md)
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
 	opts = append((*c.CallOptions).TestIamPermissions[0:len((*c.CallOptions).TestIamPermissions):len((*c.CallOptions).TestIamPermissions)], opts...)
 	var resp *iampb.TestIamPermissionsResponse
 	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 		var err error
-		resp, err = c.iamPolicyClient.TestIamPermissions(ctx, req, settings.GRPC...)
+		resp, err = executeRPC(ctx, c.iamPolicyClient.TestIamPermissions, req, settings.GRPC, c.logger, "TestIamPermissions")
+		return err
+	}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *keyManagementGRPCClient) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest, opts ...gax.CallOption) (*longrunningpb.Operation, error) {
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
+
+	hds = append(c.xGoogHeaders, hds...)
+	ctx = gax.InsertMetadataIntoOutgoingContext(ctx, hds...)
+	opts = append((*c.CallOptions).GetOperation[0:len((*c.CallOptions).GetOperation):len((*c.CallOptions).GetOperation)], opts...)
+	var resp *longrunningpb.Operation
+	err := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		var err error
+		resp, err = executeRPC(ctx, c.operationsClient.GetOperation, req, settings.GRPC, c.logger, "GetOperation")
 		return err
 	}, opts...)
 	if err != nil {
@@ -2011,7 +2121,8 @@ func (c *keyManagementRESTClient) ListKeyRings(ctx context.Context, req *kmspb.L
 		baseUrl.RawQuery = params.Encode()
 
 		// Build HTTP headers from client and context metadata.
-		headers := buildHeaders(ctx, c.xGoogMetadata, metadata.Pairs("Content-Type", "application/json"))
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
 		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			if settings.Path != "" {
 				baseUrl.Path = settings.Path
@@ -2022,21 +2133,10 @@ func (c *keyManagementRESTClient) ListKeyRings(ctx context.Context, req *kmspb.L
 			}
 			httpReq.Header = headers
 
-			httpRsp, err := c.httpClient.Do(httpReq)
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListKeyRings")
 			if err != nil {
 				return err
 			}
-			defer httpRsp.Body.Close()
-
-			if err = googleapi.CheckResponse(httpRsp); err != nil {
-				return err
-			}
-
-			buf, err := io.ReadAll(httpRsp.Body)
-			if err != nil {
-				return err
-			}
-
 			if err := unm.Unmarshal(buf, resp); err != nil {
 				return err
 			}
@@ -2108,7 +2208,8 @@ func (c *keyManagementRESTClient) ListCryptoKeys(ctx context.Context, req *kmspb
 		baseUrl.RawQuery = params.Encode()
 
 		// Build HTTP headers from client and context metadata.
-		headers := buildHeaders(ctx, c.xGoogMetadata, metadata.Pairs("Content-Type", "application/json"))
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
 		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			if settings.Path != "" {
 				baseUrl.Path = settings.Path
@@ -2119,21 +2220,10 @@ func (c *keyManagementRESTClient) ListCryptoKeys(ctx context.Context, req *kmspb
 			}
 			httpReq.Header = headers
 
-			httpRsp, err := c.httpClient.Do(httpReq)
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListCryptoKeys")
 			if err != nil {
 				return err
 			}
-			defer httpRsp.Body.Close()
-
-			if err = googleapi.CheckResponse(httpRsp); err != nil {
-				return err
-			}
-
-			buf, err := io.ReadAll(httpRsp.Body)
-			if err != nil {
-				return err
-			}
-
 			if err := unm.Unmarshal(buf, resp); err != nil {
 				return err
 			}
@@ -2205,7 +2295,8 @@ func (c *keyManagementRESTClient) ListCryptoKeyVersions(ctx context.Context, req
 		baseUrl.RawQuery = params.Encode()
 
 		// Build HTTP headers from client and context metadata.
-		headers := buildHeaders(ctx, c.xGoogMetadata, metadata.Pairs("Content-Type", "application/json"))
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
 		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			if settings.Path != "" {
 				baseUrl.Path = settings.Path
@@ -2216,21 +2307,10 @@ func (c *keyManagementRESTClient) ListCryptoKeyVersions(ctx context.Context, req
 			}
 			httpReq.Header = headers
 
-			httpRsp, err := c.httpClient.Do(httpReq)
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListCryptoKeyVersions")
 			if err != nil {
 				return err
 			}
-			defer httpRsp.Body.Close()
-
-			if err = googleapi.CheckResponse(httpRsp); err != nil {
-				return err
-			}
-
-			buf, err := io.ReadAll(httpRsp.Body)
-			if err != nil {
-				return err
-			}
-
 			if err := unm.Unmarshal(buf, resp); err != nil {
 				return err
 			}
@@ -2299,7 +2379,8 @@ func (c *keyManagementRESTClient) ListImportJobs(ctx context.Context, req *kmspb
 		baseUrl.RawQuery = params.Encode()
 
 		// Build HTTP headers from client and context metadata.
-		headers := buildHeaders(ctx, c.xGoogMetadata, metadata.Pairs("Content-Type", "application/json"))
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
 		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			if settings.Path != "" {
 				baseUrl.Path = settings.Path
@@ -2310,21 +2391,10 @@ func (c *keyManagementRESTClient) ListImportJobs(ctx context.Context, req *kmspb
 			}
 			httpReq.Header = headers
 
-			httpRsp, err := c.httpClient.Do(httpReq)
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListImportJobs")
 			if err != nil {
 				return err
 			}
-			defer httpRsp.Body.Close()
-
-			if err = googleapi.CheckResponse(httpRsp); err != nil {
-				return err
-			}
-
-			buf, err := io.ReadAll(httpRsp.Body)
-			if err != nil {
-				return err
-			}
-
 			if err := unm.Unmarshal(buf, resp); err != nil {
 				return err
 			}
@@ -2368,9 +2438,11 @@ func (c *keyManagementRESTClient) GetKeyRing(ctx context.Context, req *kmspb.Get
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetKeyRing[0:len((*c.CallOptions).GetKeyRing):len((*c.CallOptions).GetKeyRing)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.KeyRing{}
@@ -2385,17 +2457,7 @@ func (c *keyManagementRESTClient) GetKeyRing(ctx context.Context, req *kmspb.Get
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetKeyRing")
 		if err != nil {
 			return err
 		}
@@ -2428,9 +2490,11 @@ func (c *keyManagementRESTClient) GetCryptoKey(ctx context.Context, req *kmspb.G
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetCryptoKey[0:len((*c.CallOptions).GetCryptoKey):len((*c.CallOptions).GetCryptoKey)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKey{}
@@ -2445,17 +2509,7 @@ func (c *keyManagementRESTClient) GetCryptoKey(ctx context.Context, req *kmspb.G
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetCryptoKey")
 		if err != nil {
 			return err
 		}
@@ -2487,9 +2541,11 @@ func (c *keyManagementRESTClient) GetCryptoKeyVersion(ctx context.Context, req *
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetCryptoKeyVersion[0:len((*c.CallOptions).GetCryptoKeyVersion):len((*c.CallOptions).GetCryptoKeyVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKeyVersion{}
@@ -2504,17 +2560,7 @@ func (c *keyManagementRESTClient) GetCryptoKeyVersion(ctx context.Context, req *
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetCryptoKeyVersion")
 		if err != nil {
 			return err
 		}
@@ -2546,13 +2592,18 @@ func (c *keyManagementRESTClient) GetPublicKey(ctx context.Context, req *kmspb.G
 
 	params := url.Values{}
 	params.Add("$alt", "json;enum-encoding=int")
+	if req.GetPublicKeyFormat() != 0 {
+		params.Add("publicKeyFormat", fmt.Sprintf("%v", req.GetPublicKeyFormat()))
+	}
 
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetPublicKey[0:len((*c.CallOptions).GetPublicKey):len((*c.CallOptions).GetPublicKey)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.PublicKey{}
@@ -2567,17 +2618,7 @@ func (c *keyManagementRESTClient) GetPublicKey(ctx context.Context, req *kmspb.G
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetPublicKey")
 		if err != nil {
 			return err
 		}
@@ -2608,9 +2649,11 @@ func (c *keyManagementRESTClient) GetImportJob(ctx context.Context, req *kmspb.G
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetImportJob[0:len((*c.CallOptions).GetImportJob):len((*c.CallOptions).GetImportJob)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.ImportJob{}
@@ -2625,17 +2668,7 @@ func (c *keyManagementRESTClient) GetImportJob(ctx context.Context, req *kmspb.G
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetImportJob")
 		if err != nil {
 			return err
 		}
@@ -2675,9 +2708,11 @@ func (c *keyManagementRESTClient) CreateKeyRing(ctx context.Context, req *kmspb.
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).CreateKeyRing[0:len((*c.CallOptions).CreateKeyRing):len((*c.CallOptions).CreateKeyRing)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.KeyRing{}
@@ -2692,17 +2727,7 @@ func (c *keyManagementRESTClient) CreateKeyRing(ctx context.Context, req *kmspb.
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "CreateKeyRing")
 		if err != nil {
 			return err
 		}
@@ -2749,9 +2774,11 @@ func (c *keyManagementRESTClient) CreateCryptoKey(ctx context.Context, req *kmsp
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).CreateCryptoKey[0:len((*c.CallOptions).CreateCryptoKey):len((*c.CallOptions).CreateCryptoKey)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKey{}
@@ -2766,17 +2793,7 @@ func (c *keyManagementRESTClient) CreateCryptoKey(ctx context.Context, req *kmsp
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "CreateCryptoKey")
 		if err != nil {
 			return err
 		}
@@ -2819,9 +2836,11 @@ func (c *keyManagementRESTClient) CreateCryptoKeyVersion(ctx context.Context, re
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).CreateCryptoKeyVersion[0:len((*c.CallOptions).CreateCryptoKeyVersion):len((*c.CallOptions).CreateCryptoKeyVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKeyVersion{}
@@ -2836,17 +2855,7 @@ func (c *keyManagementRESTClient) CreateCryptoKeyVersion(ctx context.Context, re
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "CreateCryptoKeyVersion")
 		if err != nil {
 			return err
 		}
@@ -2890,9 +2899,11 @@ func (c *keyManagementRESTClient) ImportCryptoKeyVersion(ctx context.Context, re
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).ImportCryptoKeyVersion[0:len((*c.CallOptions).ImportCryptoKeyVersion):len((*c.CallOptions).ImportCryptoKeyVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKeyVersion{}
@@ -2907,17 +2918,7 @@ func (c *keyManagementRESTClient) ImportCryptoKeyVersion(ctx context.Context, re
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "ImportCryptoKeyVersion")
 		if err != nil {
 			return err
 		}
@@ -2960,9 +2961,11 @@ func (c *keyManagementRESTClient) CreateImportJob(ctx context.Context, req *kmsp
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "parent", url.QueryEscape(req.GetParent()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).CreateImportJob[0:len((*c.CallOptions).CreateImportJob):len((*c.CallOptions).CreateImportJob)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.ImportJob{}
@@ -2977,17 +2980,7 @@ func (c *keyManagementRESTClient) CreateImportJob(ctx context.Context, req *kmsp
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "CreateImportJob")
 		if err != nil {
 			return err
 		}
@@ -3022,19 +3015,21 @@ func (c *keyManagementRESTClient) UpdateCryptoKey(ctx context.Context, req *kmsp
 	params := url.Values{}
 	params.Add("$alt", "json;enum-encoding=int")
 	if req.GetUpdateMask() != nil {
-		updateMask, err := protojson.Marshal(req.GetUpdateMask())
+		field, err := protojson.Marshal(req.GetUpdateMask())
 		if err != nil {
 			return nil, err
 		}
-		params.Add("updateMask", string(updateMask[1:len(updateMask)-1]))
+		params.Add("updateMask", string(field[1:len(field)-1]))
 	}
 
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key.name", url.QueryEscape(req.GetCryptoKey().GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key.name", url.QueryEscape(req.GetCryptoKey().GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).UpdateCryptoKey[0:len((*c.CallOptions).UpdateCryptoKey):len((*c.CallOptions).UpdateCryptoKey)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKey{}
@@ -3049,17 +3044,7 @@ func (c *keyManagementRESTClient) UpdateCryptoKey(ctx context.Context, req *kmsp
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "UpdateCryptoKey")
 		if err != nil {
 			return err
 		}
@@ -3105,19 +3090,21 @@ func (c *keyManagementRESTClient) UpdateCryptoKeyVersion(ctx context.Context, re
 	params := url.Values{}
 	params.Add("$alt", "json;enum-encoding=int")
 	if req.GetUpdateMask() != nil {
-		updateMask, err := protojson.Marshal(req.GetUpdateMask())
+		field, err := protojson.Marshal(req.GetUpdateMask())
 		if err != nil {
 			return nil, err
 		}
-		params.Add("updateMask", string(updateMask[1:len(updateMask)-1]))
+		params.Add("updateMask", string(field[1:len(field)-1]))
 	}
 
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key_version.name", url.QueryEscape(req.GetCryptoKeyVersion().GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "crypto_key_version.name", url.QueryEscape(req.GetCryptoKeyVersion().GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).UpdateCryptoKeyVersion[0:len((*c.CallOptions).UpdateCryptoKeyVersion):len((*c.CallOptions).UpdateCryptoKeyVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKeyVersion{}
@@ -3132,17 +3119,7 @@ func (c *keyManagementRESTClient) UpdateCryptoKeyVersion(ctx context.Context, re
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "UpdateCryptoKeyVersion")
 		if err != nil {
 			return err
 		}
@@ -3184,9 +3161,11 @@ func (c *keyManagementRESTClient) UpdateCryptoKeyPrimaryVersion(ctx context.Cont
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).UpdateCryptoKeyPrimaryVersion[0:len((*c.CallOptions).UpdateCryptoKeyPrimaryVersion):len((*c.CallOptions).UpdateCryptoKeyPrimaryVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKey{}
@@ -3201,17 +3180,7 @@ func (c *keyManagementRESTClient) UpdateCryptoKeyPrimaryVersion(ctx context.Cont
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "UpdateCryptoKeyPrimaryVersion")
 		if err != nil {
 			return err
 		}
@@ -3268,9 +3237,11 @@ func (c *keyManagementRESTClient) DestroyCryptoKeyVersion(ctx context.Context, r
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).DestroyCryptoKeyVersion[0:len((*c.CallOptions).DestroyCryptoKeyVersion):len((*c.CallOptions).DestroyCryptoKeyVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKeyVersion{}
@@ -3285,17 +3256,7 @@ func (c *keyManagementRESTClient) DestroyCryptoKeyVersion(ctx context.Context, r
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "DestroyCryptoKeyVersion")
 		if err != nil {
 			return err
 		}
@@ -3340,9 +3301,11 @@ func (c *keyManagementRESTClient) RestoreCryptoKeyVersion(ctx context.Context, r
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).RestoreCryptoKeyVersion[0:len((*c.CallOptions).RestoreCryptoKeyVersion):len((*c.CallOptions).RestoreCryptoKeyVersion)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.CryptoKeyVersion{}
@@ -3357,17 +3320,7 @@ func (c *keyManagementRESTClient) RestoreCryptoKeyVersion(ctx context.Context, r
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "RestoreCryptoKeyVersion")
 		if err != nil {
 			return err
 		}
@@ -3407,9 +3360,11 @@ func (c *keyManagementRESTClient) Encrypt(ctx context.Context, req *kmspb.Encryp
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).Encrypt[0:len((*c.CallOptions).Encrypt):len((*c.CallOptions).Encrypt)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.EncryptResponse{}
@@ -3424,17 +3379,7 @@ func (c *keyManagementRESTClient) Encrypt(ctx context.Context, req *kmspb.Encryp
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "Encrypt")
 		if err != nil {
 			return err
 		}
@@ -3474,9 +3419,11 @@ func (c *keyManagementRESTClient) Decrypt(ctx context.Context, req *kmspb.Decryp
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).Decrypt[0:len((*c.CallOptions).Decrypt):len((*c.CallOptions).Decrypt)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.DecryptResponse{}
@@ -3491,17 +3438,7 @@ func (c *keyManagementRESTClient) Decrypt(ctx context.Context, req *kmspb.Decryp
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "Decrypt")
 		if err != nil {
 			return err
 		}
@@ -3543,9 +3480,11 @@ func (c *keyManagementRESTClient) RawEncrypt(ctx context.Context, req *kmspb.Raw
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).RawEncrypt[0:len((*c.CallOptions).RawEncrypt):len((*c.CallOptions).RawEncrypt)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.RawEncryptResponse{}
@@ -3560,17 +3499,7 @@ func (c *keyManagementRESTClient) RawEncrypt(ctx context.Context, req *kmspb.Raw
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "RawEncrypt")
 		if err != nil {
 			return err
 		}
@@ -3610,9 +3539,11 @@ func (c *keyManagementRESTClient) RawDecrypt(ctx context.Context, req *kmspb.Raw
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).RawDecrypt[0:len((*c.CallOptions).RawDecrypt):len((*c.CallOptions).RawDecrypt)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.RawDecryptResponse{}
@@ -3627,17 +3558,7 @@ func (c *keyManagementRESTClient) RawDecrypt(ctx context.Context, req *kmspb.Raw
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "RawDecrypt")
 		if err != nil {
 			return err
 		}
@@ -3678,9 +3599,11 @@ func (c *keyManagementRESTClient) AsymmetricSign(ctx context.Context, req *kmspb
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).AsymmetricSign[0:len((*c.CallOptions).AsymmetricSign):len((*c.CallOptions).AsymmetricSign)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.AsymmetricSignResponse{}
@@ -3695,17 +3618,7 @@ func (c *keyManagementRESTClient) AsymmetricSign(ctx context.Context, req *kmspb
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "AsymmetricSign")
 		if err != nil {
 			return err
 		}
@@ -3746,9 +3659,11 @@ func (c *keyManagementRESTClient) AsymmetricDecrypt(ctx context.Context, req *km
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).AsymmetricDecrypt[0:len((*c.CallOptions).AsymmetricDecrypt):len((*c.CallOptions).AsymmetricDecrypt)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.AsymmetricDecryptResponse{}
@@ -3763,17 +3678,7 @@ func (c *keyManagementRESTClient) AsymmetricDecrypt(ctx context.Context, req *km
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "AsymmetricDecrypt")
 		if err != nil {
 			return err
 		}
@@ -3812,9 +3717,11 @@ func (c *keyManagementRESTClient) MacSign(ctx context.Context, req *kmspb.MacSig
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).MacSign[0:len((*c.CallOptions).MacSign):len((*c.CallOptions).MacSign)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.MacSignResponse{}
@@ -3829,17 +3736,7 @@ func (c *keyManagementRESTClient) MacSign(ctx context.Context, req *kmspb.MacSig
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "MacSign")
 		if err != nil {
 			return err
 		}
@@ -3879,9 +3776,11 @@ func (c *keyManagementRESTClient) MacVerify(ctx context.Context, req *kmspb.MacV
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).MacVerify[0:len((*c.CallOptions).MacVerify):len((*c.CallOptions).MacVerify)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.MacVerifyResponse{}
@@ -3896,17 +3795,67 @@ func (c *keyManagementRESTClient) MacVerify(ctx context.Context, req *kmspb.MacV
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "MacVerify")
 		if err != nil {
 			return err
 		}
-		defer httpRsp.Body.Close()
 
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
+		if err := unm.Unmarshal(buf, resp); err != nil {
 			return err
 		}
 
-		buf, err := io.ReadAll(httpRsp.Body)
+		return nil
+	}, opts...)
+	if e != nil {
+		return nil, e
+	}
+	return resp, nil
+}
+
+// Decapsulate decapsulates data that was encapsulated with a public key retrieved from
+// GetPublicKey
+// corresponding to a CryptoKeyVersion
+// with CryptoKey.purpose
+// KEY_ENCAPSULATION.
+func (c *keyManagementRESTClient) Decapsulate(ctx context.Context, req *kmspb.DecapsulateRequest, opts ...gax.CallOption) (*kmspb.DecapsulateResponse, error) {
+	m := protojson.MarshalOptions{AllowPartial: true, UseEnumNumbers: true}
+	jsonReq, err := m.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		return nil, err
+	}
+	baseUrl.Path += fmt.Sprintf("/v1/%v:decapsulate", req.GetName())
+
+	params := url.Values{}
+	params.Add("$alt", "json;enum-encoding=int")
+
+	baseUrl.RawQuery = params.Encode()
+
+	// Build HTTP headers from client and context metadata.
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
+
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
+	opts = append((*c.CallOptions).Decapsulate[0:len((*c.CallOptions).Decapsulate):len((*c.CallOptions).Decapsulate)], opts...)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	resp := &kmspb.DecapsulateResponse{}
+	e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		if settings.Path != "" {
+			baseUrl.Path = settings.Path
+		}
+		httpReq, err := http.NewRequest("POST", baseUrl.String(), bytes.NewReader(jsonReq))
+		if err != nil {
+			return err
+		}
+		httpReq = httpReq.WithContext(ctx)
+		httpReq.Header = headers
+
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "Decapsulate")
 		if err != nil {
 			return err
 		}
@@ -3944,9 +3893,11 @@ func (c *keyManagementRESTClient) GenerateRandomBytes(ctx context.Context, req *
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "location", url.QueryEscape(req.GetLocation())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "location", url.QueryEscape(req.GetLocation()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GenerateRandomBytes[0:len((*c.CallOptions).GenerateRandomBytes):len((*c.CallOptions).GenerateRandomBytes)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &kmspb.GenerateRandomBytesResponse{}
@@ -3961,17 +3912,7 @@ func (c *keyManagementRESTClient) GenerateRandomBytes(ctx context.Context, req *
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "GenerateRandomBytes")
 		if err != nil {
 			return err
 		}
@@ -4002,9 +3943,11 @@ func (c *keyManagementRESTClient) GetLocation(ctx context.Context, req *location
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetLocation[0:len((*c.CallOptions).GetLocation):len((*c.CallOptions).GetLocation)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &locationpb.Location{}
@@ -4019,17 +3962,7 @@ func (c *keyManagementRESTClient) GetLocation(ctx context.Context, req *location
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetLocation")
 		if err != nil {
 			return err
 		}
@@ -4082,7 +4015,8 @@ func (c *keyManagementRESTClient) ListLocations(ctx context.Context, req *locati
 		baseUrl.RawQuery = params.Encode()
 
 		// Build HTTP headers from client and context metadata.
-		headers := buildHeaders(ctx, c.xGoogMetadata, metadata.Pairs("Content-Type", "application/json"))
+		hds := append(c.xGoogHeaders, "Content-Type", "application/json")
+		headers := gax.BuildHeaders(ctx, hds...)
 		e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
 			if settings.Path != "" {
 				baseUrl.Path = settings.Path
@@ -4093,21 +4027,10 @@ func (c *keyManagementRESTClient) ListLocations(ctx context.Context, req *locati
 			}
 			httpReq.Header = headers
 
-			httpRsp, err := c.httpClient.Do(httpReq)
+			buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "ListLocations")
 			if err != nil {
 				return err
 			}
-			defer httpRsp.Body.Close()
-
-			if err = googleapi.CheckResponse(httpRsp); err != nil {
-				return err
-			}
-
-			buf, err := io.ReadAll(httpRsp.Body)
-			if err != nil {
-				return err
-			}
-
 			if err := unm.Unmarshal(buf, resp); err != nil {
 				return err
 			}
@@ -4155,9 +4078,11 @@ func (c *keyManagementRESTClient) GetIamPolicy(ctx context.Context, req *iampb.G
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).GetIamPolicy[0:len((*c.CallOptions).GetIamPolicy):len((*c.CallOptions).GetIamPolicy)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &iampb.Policy{}
@@ -4172,17 +4097,7 @@ func (c *keyManagementRESTClient) GetIamPolicy(ctx context.Context, req *iampb.G
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetIamPolicy")
 		if err != nil {
 			return err
 		}
@@ -4223,9 +4138,11 @@ func (c *keyManagementRESTClient) SetIamPolicy(ctx context.Context, req *iampb.S
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).SetIamPolicy[0:len((*c.CallOptions).SetIamPolicy):len((*c.CallOptions).SetIamPolicy)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &iampb.Policy{}
@@ -4240,17 +4157,7 @@ func (c *keyManagementRESTClient) SetIamPolicy(ctx context.Context, req *iampb.S
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "SetIamPolicy")
 		if err != nil {
 			return err
 		}
@@ -4293,9 +4200,11 @@ func (c *keyManagementRESTClient) TestIamPermissions(ctx context.Context, req *i
 	baseUrl.RawQuery = params.Encode()
 
 	// Build HTTP headers from client and context metadata.
-	md := metadata.Pairs("x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource())))
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "resource", url.QueryEscape(req.GetResource()))}
 
-	headers := buildHeaders(ctx, c.xGoogMetadata, md, metadata.Pairs("Content-Type", "application/json"))
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
 	opts = append((*c.CallOptions).TestIamPermissions[0:len((*c.CallOptions).TestIamPermissions):len((*c.CallOptions).TestIamPermissions)], opts...)
 	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 	resp := &iampb.TestIamPermissionsResponse{}
@@ -4310,17 +4219,7 @@ func (c *keyManagementRESTClient) TestIamPermissions(ctx context.Context, req *i
 		httpReq = httpReq.WithContext(ctx)
 		httpReq.Header = headers
 
-		httpRsp, err := c.httpClient.Do(httpReq)
-		if err != nil {
-			return err
-		}
-		defer httpRsp.Body.Close()
-
-		if err = googleapi.CheckResponse(httpRsp); err != nil {
-			return err
-		}
-
-		buf, err := io.ReadAll(httpRsp.Body)
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, jsonReq, "TestIamPermissions")
 		if err != nil {
 			return err
 		}
@@ -4337,190 +4236,52 @@ func (c *keyManagementRESTClient) TestIamPermissions(ctx context.Context, req *i
 	return resp, nil
 }
 
-// CryptoKeyIterator manages a stream of *kmspb.CryptoKey.
-type CryptoKeyIterator struct {
-	items    []*kmspb.CryptoKey
-	pageInfo *iterator.PageInfo
-	nextFunc func() error
-
-	// Response is the raw response for the current page.
-	// It must be cast to the RPC response type.
-	// Calling Next() or InternalFetch() updates this value.
-	Response interface{}
-
-	// InternalFetch is for use by the Google Cloud Libraries only.
-	// It is not part of the stable interface of this package.
-	//
-	// InternalFetch returns results from a single call to the underlying RPC.
-	// The number of results is no greater than pageSize.
-	// If there are no more results, nextPageToken is empty and err is nil.
-	InternalFetch func(pageSize int, pageToken string) (results []*kmspb.CryptoKey, nextPageToken string, err error)
-}
-
-// PageInfo supports pagination. See the google.golang.org/api/iterator package for details.
-func (it *CryptoKeyIterator) PageInfo() *iterator.PageInfo {
-	return it.pageInfo
-}
-
-// Next returns the next result. Its second return value is iterator.Done if there are no more
-// results. Once Next returns Done, all subsequent calls will return Done.
-func (it *CryptoKeyIterator) Next() (*kmspb.CryptoKey, error) {
-	var item *kmspb.CryptoKey
-	if err := it.nextFunc(); err != nil {
-		return item, err
+// GetOperation is a utility method from google.longrunning.Operations.
+func (c *keyManagementRESTClient) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest, opts ...gax.CallOption) (*longrunningpb.Operation, error) {
+	baseUrl, err := url.Parse(c.endpoint)
+	if err != nil {
+		return nil, err
 	}
-	item = it.items[0]
-	it.items = it.items[1:]
-	return item, nil
-}
+	baseUrl.Path += fmt.Sprintf("/v1/%v", req.GetName())
 
-func (it *CryptoKeyIterator) bufLen() int {
-	return len(it.items)
-}
+	params := url.Values{}
+	params.Add("$alt", "json;enum-encoding=int")
 
-func (it *CryptoKeyIterator) takeBuf() interface{} {
-	b := it.items
-	it.items = nil
-	return b
-}
+	baseUrl.RawQuery = params.Encode()
 
-// CryptoKeyVersionIterator manages a stream of *kmspb.CryptoKeyVersion.
-type CryptoKeyVersionIterator struct {
-	items    []*kmspb.CryptoKeyVersion
-	pageInfo *iterator.PageInfo
-	nextFunc func() error
+	// Build HTTP headers from client and context metadata.
+	hds := []string{"x-goog-request-params", fmt.Sprintf("%s=%v", "name", url.QueryEscape(req.GetName()))}
 
-	// Response is the raw response for the current page.
-	// It must be cast to the RPC response type.
-	// Calling Next() or InternalFetch() updates this value.
-	Response interface{}
+	hds = append(c.xGoogHeaders, hds...)
+	hds = append(hds, "Content-Type", "application/json")
+	headers := gax.BuildHeaders(ctx, hds...)
+	opts = append((*c.CallOptions).GetOperation[0:len((*c.CallOptions).GetOperation):len((*c.CallOptions).GetOperation)], opts...)
+	unm := protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
+	resp := &longrunningpb.Operation{}
+	e := gax.Invoke(ctx, func(ctx context.Context, settings gax.CallSettings) error {
+		if settings.Path != "" {
+			baseUrl.Path = settings.Path
+		}
+		httpReq, err := http.NewRequest("GET", baseUrl.String(), nil)
+		if err != nil {
+			return err
+		}
+		httpReq = httpReq.WithContext(ctx)
+		httpReq.Header = headers
 
-	// InternalFetch is for use by the Google Cloud Libraries only.
-	// It is not part of the stable interface of this package.
-	//
-	// InternalFetch returns results from a single call to the underlying RPC.
-	// The number of results is no greater than pageSize.
-	// If there are no more results, nextPageToken is empty and err is nil.
-	InternalFetch func(pageSize int, pageToken string) (results []*kmspb.CryptoKeyVersion, nextPageToken string, err error)
-}
+		buf, err := executeHTTPRequest(ctx, c.httpClient, httpReq, c.logger, nil, "GetOperation")
+		if err != nil {
+			return err
+		}
 
-// PageInfo supports pagination. See the google.golang.org/api/iterator package for details.
-func (it *CryptoKeyVersionIterator) PageInfo() *iterator.PageInfo {
-	return it.pageInfo
-}
+		if err := unm.Unmarshal(buf, resp); err != nil {
+			return err
+		}
 
-// Next returns the next result. Its second return value is iterator.Done if there are no more
-// results. Once Next returns Done, all subsequent calls will return Done.
-func (it *CryptoKeyVersionIterator) Next() (*kmspb.CryptoKeyVersion, error) {
-	var item *kmspb.CryptoKeyVersion
-	if err := it.nextFunc(); err != nil {
-		return item, err
+		return nil
+	}, opts...)
+	if e != nil {
+		return nil, e
 	}
-	item = it.items[0]
-	it.items = it.items[1:]
-	return item, nil
-}
-
-func (it *CryptoKeyVersionIterator) bufLen() int {
-	return len(it.items)
-}
-
-func (it *CryptoKeyVersionIterator) takeBuf() interface{} {
-	b := it.items
-	it.items = nil
-	return b
-}
-
-// ImportJobIterator manages a stream of *kmspb.ImportJob.
-type ImportJobIterator struct {
-	items    []*kmspb.ImportJob
-	pageInfo *iterator.PageInfo
-	nextFunc func() error
-
-	// Response is the raw response for the current page.
-	// It must be cast to the RPC response type.
-	// Calling Next() or InternalFetch() updates this value.
-	Response interface{}
-
-	// InternalFetch is for use by the Google Cloud Libraries only.
-	// It is not part of the stable interface of this package.
-	//
-	// InternalFetch returns results from a single call to the underlying RPC.
-	// The number of results is no greater than pageSize.
-	// If there are no more results, nextPageToken is empty and err is nil.
-	InternalFetch func(pageSize int, pageToken string) (results []*kmspb.ImportJob, nextPageToken string, err error)
-}
-
-// PageInfo supports pagination. See the google.golang.org/api/iterator package for details.
-func (it *ImportJobIterator) PageInfo() *iterator.PageInfo {
-	return it.pageInfo
-}
-
-// Next returns the next result. Its second return value is iterator.Done if there are no more
-// results. Once Next returns Done, all subsequent calls will return Done.
-func (it *ImportJobIterator) Next() (*kmspb.ImportJob, error) {
-	var item *kmspb.ImportJob
-	if err := it.nextFunc(); err != nil {
-		return item, err
-	}
-	item = it.items[0]
-	it.items = it.items[1:]
-	return item, nil
-}
-
-func (it *ImportJobIterator) bufLen() int {
-	return len(it.items)
-}
-
-func (it *ImportJobIterator) takeBuf() interface{} {
-	b := it.items
-	it.items = nil
-	return b
-}
-
-// KeyRingIterator manages a stream of *kmspb.KeyRing.
-type KeyRingIterator struct {
-	items    []*kmspb.KeyRing
-	pageInfo *iterator.PageInfo
-	nextFunc func() error
-
-	// Response is the raw response for the current page.
-	// It must be cast to the RPC response type.
-	// Calling Next() or InternalFetch() updates this value.
-	Response interface{}
-
-	// InternalFetch is for use by the Google Cloud Libraries only.
-	// It is not part of the stable interface of this package.
-	//
-	// InternalFetch returns results from a single call to the underlying RPC.
-	// The number of results is no greater than pageSize.
-	// If there are no more results, nextPageToken is empty and err is nil.
-	InternalFetch func(pageSize int, pageToken string) (results []*kmspb.KeyRing, nextPageToken string, err error)
-}
-
-// PageInfo supports pagination. See the google.golang.org/api/iterator package for details.
-func (it *KeyRingIterator) PageInfo() *iterator.PageInfo {
-	return it.pageInfo
-}
-
-// Next returns the next result. Its second return value is iterator.Done if there are no more
-// results. Once Next returns Done, all subsequent calls will return Done.
-func (it *KeyRingIterator) Next() (*kmspb.KeyRing, error) {
-	var item *kmspb.KeyRing
-	if err := it.nextFunc(); err != nil {
-		return item, err
-	}
-	item = it.items[0]
-	it.items = it.items[1:]
-	return item, nil
-}
-
-func (it *KeyRingIterator) bufLen() int {
-	return len(it.items)
-}
-
-func (it *KeyRingIterator) takeBuf() interface{} {
-	b := it.items
-	it.items = nil
-	return b
+	return resp, nil
 }
